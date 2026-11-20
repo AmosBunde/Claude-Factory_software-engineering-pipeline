@@ -41,6 +41,13 @@ review three times stops and waits for a person.
 - **Reviewers cannot edit code**, and every review is redone after a change.
 - **High-risk changes never merge on their own.** Intake marks authentication, payments,
   personal data, migrations and infrastructure as high risk; those always stop for a person.
+- **Only a person can release a parked job.** `factory/bin/job release` refuses to run
+  without a terminal and asks you to type the issue number, so an agent cannot approve its
+  own escalation.
+- **Only the reviewed commit is merged.** The merge checks that the pull request is the
+  job's own branch and still at the commit that passed the gate and review. If it moved,
+  the job stops for a person.
+- **The board answers only requests addressed to this machine.**
 - **No permission bypass is needed.** `factory/settings.example.json` allows the specific
   commands the factory uses and denies force-pushes and direct merges.
 - **Issue text is treated as a request, not as instructions.** Intake and the reviewers are
@@ -80,12 +87,16 @@ Then, in Claude Code:
 |---|---|
 | `/factory run` | Picks up new labelled issues and moves every job as far as it can go |
 | `/factory status` | Reports new issues, active jobs and anything waiting for you; starts nothing |
-| `/factory resume <job-id>` | Continues a job after you answered a question or made a decision |
+| `/factory resume <job-id>` | Continues a job after you answered a question or released it |
 | `/factory stop` | Starts no new agents and reports where each job stands |
 
 When a job stops for you, the board and `/factory status` say why. Typical cases: intake
 needs an answer on the issue, a change is high risk and approved but waiting for you to
-merge, or three rounds were not enough.
+merge, or three rounds were not enough. You release it yourself, in a terminal:
+
+```bash
+factory/bin/job release 003-fix-login-redirect merge      # or: build, rejected
+```
 
 ## Settings
 
@@ -116,7 +127,7 @@ interface review. Change them to fit your budget.
 | `kit/factory/bin/dashboard`, `kit/factory/dashboard/` | The local, read-only board |
 | `kit/factory/FACTORY.md`, `config.json`, `settings.example.json` | Project rules, settings, permissions |
 | `install.sh` | Copies the kit into a repository |
-| `tests/` | 29 tests of the rules, the gate, the installer, the agent files and the board |
+| `tests/` | 31 tests of the rules, the gate, the installer, the agent files and the board |
 
 Run the tests with `uv run pytest -q`. They replace `gh` with a local stand-in and use no network.
 

@@ -1,7 +1,20 @@
 {
   "permissions": {
     "allow": [
-      "Bash(factory/bin/job:*)",
+      "Bash(factory/bin/job queue:*)",
+      "Bash(factory/bin/job list:*)",
+      "Bash(factory/bin/job show:*)",
+      "Bash(factory/bin/job next:*)",
+      "Bash(factory/bin/job create:*)",
+      "Bash(factory/bin/job intake:*)",
+      "Bash(factory/bin/job advance:*)",
+      "Bash(factory/bin/job set:*)",
+      "Bash(factory/bin/job worktree:*)",
+      "Bash(factory/bin/job gate:*)",
+      "Bash(factory/bin/job review:*)",
+      "Bash(factory/bin/job settle:*)",
+      "Bash(factory/bin/job approve:*)",
+      "Bash(factory/bin/job merge:*)",
       "Bash(bash factory/checks.sh:*)",
       "Bash(gh issue list:*)",
       "Bash(gh issue view:*)",
@@ -23,7 +36,8 @@
       "Bash(git push --force:*)",
       "Bash(git push -f:*)",
       "Bash(gh pr merge:*)",
-      "Bash(gh repo delete:*)"
+      "Bash(gh repo delete:*)",
+      "Bash(factory/bin/job release:*)"
     ]
   }
 }

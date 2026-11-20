@@ -20,9 +20,10 @@ The request is: `$ARGUMENTS` (treat an empty request as `status`).
   new issues, active jobs with their stage, and anything waiting on a person and why. Start nothing.
 - **`run`**: the loop below, until no job can move.
 - **`resume <job-id>`**: a person has dealt with a parked job. Check `factory/bin/job show <id>`.
-  For `needs-info`, run `factory/bin/job advance <id> intake`. For `needs-human`, ask the user
-  which they want (`build` to try again, `merge` to merge an approved job, `rejected` to drop it)
-  unless they already said, then `factory/bin/job advance <id> <stage>`. Then continue as `run`.
+  For `needs-info`, run `factory/bin/job advance <id> intake`. For `needs-human` you cannot
+  release the job, by design. Tell the user what the job is waiting for and that they release it
+  themselves, in a terminal, with `factory/bin/job release <id> <build|merge|rejected>`. Once
+  the job has left `needs-human`, continue as `run`.
 - **`stop`**: start no new agents. Report what is still running and where each job stands.
 
 ## The loop for `run`
@@ -64,6 +65,7 @@ Do not paste the issue or the spec into the brief. Tell the agent where to read 
 - Never merge a pull request yourself. Only `factory/bin/job merge <id>` merges, and only when
   `job next` says so.
 - Never edit `factory/jobs/*/job.json` by hand, and never skip a stage.
+- Never run `factory/bin/job release`. It is the person's decision and it refuses to run without a terminal.
 - Never work around a failed gate or a requested change. The job goes back to the builder or to a person.
 - If a command fails in a way you do not understand, park that job by telling the user; keep the other jobs moving.
 - Comment on the issue at three points only: intake decision (the intake agent does this), pull
