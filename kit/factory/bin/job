@@ -175,9 +175,16 @@ def feedback_files(job: dict) -> list[str]:
 
 
 def bounce(job: dict, cfg: dict, reason: str) -> None:
-    """Send a job back to the builder for another round, or to a human if the rounds are used up."""
-    if job.get("round", 1) >= cfg["max_build_rounds"]:
-        job["stage"], job["blocked_on"] = "needs-human", f"{reason} after {job.get('round', 1)} rounds"
+    """Send a job back to the builder for another round, or to a human if the rounds are used up.
+
+    The round number only ever goes up, so a gate result or review recorded for one round can
+    never be mistaken for a later one. The budget is counted from `budget_start`, which a
+    person's release moves forward.
+    """
+    job.pop("approved_head", None)                     # any earlier approval was for a different commit
+    used = job.get("round", 1) - job.get("budget_start", 1) + 1
+    if used >= cfg["max_build_rounds"]:
+        job["stage"], job["blocked_on"] = "needs-human", f"{reason} after {used} rounds"
         log(job, "escalated", job["blocked_on"])
     else:
         job["round"] = job.get("round", 1) + 1
@@ -292,13 +299,15 @@ def cmd_release(a) -> None:
         die(f"job is at {job['stage']}, not needs-human")
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         die("release must be run by a person in a terminal", 4)
-    if a.stage == "merge" and not any(h["event"] == "approver:approve" for h in job.get("history", [])):
-        die("this job was never approved; choose build or rejected")
+    if a.stage == "merge" and (not job.get("approved_head") or job["approved_head"] != gate_head(job)):
+        die("the approver has not approved the commit that is currently checked; choose build or rejected")
     print(f"{job['id']}: {job['title']}\n  parked because: {job.get('blocked_on', '')}\n  you chose: {a.stage}")
     if input(f"Type the issue number ({job['issue']}) to confirm: ").strip() != str(job["issue"]):
         die("not confirmed; nothing changed", 4)
-    if a.stage == "build":
-        job["round"] = 1
+    if a.stage == "build":                              # a fresh budget, on a round nothing has been recorded for
+        job["round"] = job.get("round", 1) + 1
+        job["budget_start"] = job["round"]
+        job.pop("approved_head", None)
     job["stage"] = a.stage
     job.pop("blocked_on", None)
     log(job, f"released-by-person:{a.stage}", a.note or "")
@@ -329,6 +338,12 @@ def check_pr(job: dict, number: int) -> dict:
     return pr
 
 
+def gate_head(job: dict) -> str | None:
+    """The commit that passed the gate in the current round, if one did."""
+    gate = job.get("gates", {}).get(str(job.get("round", 1)), {})
+    return gate.get("head") if gate.get("passed") else None
+
+
 def head_of(job: dict) -> str:
     cwd = ROOT / (job.get("worktree") or ".")
     return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=cwd).stdout.strip()
@@ -355,6 +370,26 @@ def cmd_worktree(a) -> None:
     log(job, "worktree", job["worktree"])
     save(job)
     print(job["worktree"])
+
+
+def cmd_push(a) -> None:
+    """Push a job's worktree to its own branch on origin. Never forces, never any other branch."""
+    job = load(a.id)
+    if job["stage"] != "build":
+        die(f"job is at {job['stage']}; only a build in progress can be pushed")
+    if not job.get("worktree"):
+        die("the job has no worktree yet")
+    cwd = ROOT / job["worktree"]
+    current = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True, cwd=cwd).stdout.strip()
+    if current != job["branch"] or not job["branch"].startswith("factory/"):
+        die(f"the worktree is on {current!r}, not this job's branch {job['branch']!r}", 5)
+    r = subprocess.run(["git", "push", "--set-upstream", "origin", f"HEAD:refs/heads/{job['branch']}"],
+                       capture_output=True, text=True, cwd=cwd)
+    if r.returncode != 0:
+        die(f"git push failed: {r.stderr.strip()}", 3)
+    log(job, "pushed", head_of(job))
+    save(job)
+    print(job["branch"])
 
 
 def cmd_gate(a) -> None:
@@ -423,6 +458,9 @@ def cmd_approve(a) -> None:
     elif a.verdict == "escalate":
         job.update(stage="needs-human", blocked_on=a.note or "the approver escalated")
     else:
+        if not gate_head(job):
+            die("no commit has passed the gate in this round; nothing to approve")
+        job["approved_head"] = gate_head(job)           # the approval is for this commit and no other
         too_risky = RISK.index(job.get("risk") or "high") > RISK.index(cfg["auto_merge_max_risk"])
         if not cfg["auto_merge"] or too_risky:
             job.update(stage="needs-human",
@@ -439,9 +477,10 @@ def cmd_merge(a) -> None:
         die(f"job is at {job['stage']}, not merge")
     if not job.get("pr"):
         die("the job has no pull request number; set it with `job set <id> pr=<number>`")
-    reviewed = job.get("gates", {}).get(str(job.get("round", 1)), {}).get("head")
+    reviewed = gate_head(job)
     pr = check_pr(job, job["pr"])
-    if not reviewed or pr.get("headRefOid") != reviewed:
+    if not reviewed or job.get("approved_head") != reviewed or pr.get("headRefOid") != reviewed:
+        job.pop("approved_head", None)
         job.update(stage="needs-human", blocked_on="the pull request changed after it was checked and reviewed; it was not merged")
         log(job, "merge-refused", f"reviewed {reviewed}, pull request is at {pr.get('headRefOid')}")
         save(job)
@@ -479,6 +518,7 @@ def main() -> None:
         (("stage",), {"choices": ["build", "merge", "rejected"]}), NOTE)
     add("set", cmd_set, "record pr=<number>, after checking it is this job's pull request", ID, (("pairs",), {"nargs": "+"}))
     add("worktree", cmd_worktree, "create the job's git worktree and branch", ID)
+    add("push", cmd_push, "push the job's worktree to its own branch (never forced, never another branch)", ID)
     add("gate", cmd_gate, "run factory/checks.sh in the job's worktree", ID)
     add("review", cmd_review, "record one reviewer's verdict", ID, (("reviewer",), {"choices": REVIEWERS}),
         (("verdict",), {"choices": ["approve", "changes"]}), NOTE)

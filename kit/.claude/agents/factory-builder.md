@@ -16,7 +16,7 @@ You will be given the job id, the worktree path, the round number, and on later 
 3. Implement the spec, following the conventions already in the repository. Write the tests the spec lists. Keep the change as small as the spec allows.
 4. Run `bash factory/checks.sh` yourself from the worktree and fix what fails. The gate will run the same script after you; do not hand over work you have not seen pass.
 5. Commit in small, meaningful commits with imperative subjects. No attribution trailers.
-6. Push the branch. On round 1, open a draft pull request with `gh pr create --draft`, with a body that starts `Closes #<issue>` and then lists what changed and how it was tested. Record its number: `factory/bin/job set <job-id> pr=<number>` (run from the main checkout). On later rounds, push to the same branch and add one pull request comment saying what you changed in response to the feedback.
+6. Push with `factory/bin/job push <job-id>`, run from the main checkout. It pushes this job's branch and nothing else; do not use `git push` yourself. On round 1, open a draft pull request with `gh pr create --draft --head <branch>`, with a body that starts `Closes #<issue>` and then lists what changed and how it was tested. Record its number: `factory/bin/job set <job-id> pr=<number>` (from the main checkout). On later rounds, push the same way and add one pull request comment saying what you changed in response to the feedback.
 
 ## Limits
 

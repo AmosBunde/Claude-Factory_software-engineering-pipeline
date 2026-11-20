@@ -237,7 +237,58 @@ def test_a_job_that_was_never_approved_cannot_be_released_to_merge(repo):
     assert state(repo, jid)["stage"] == "needs-human"
     assert release_as_person(repo, jid, "merge", "1").returncode != 0
     assert release_as_person(repo, jid, "build", "1").returncode == 0
-    assert state(repo, jid)["stage"] == "build" and state(repo, jid)["round"] == 1
+    s = state(repo, jid)
+    assert s["stage"] == "build" and s["round"] == 4 and s["budget_start"] == 4   # rounds never repeat
+    job(repo, "advance", jid, "gate")
+    job(repo, "gate", jid)
+    step = nxt(repo, jid)                                                         # nothing recorded earlier counts now
+    assert step["action"] == "run-agents-in-parallel" and [a["reviewer"] for a in step["agents"]] == ["code", "ux", "ui"]
+    assert job(repo, "settle", jid, ok=False).returncode != 0
+    for _ in range(2):                                                            # and the person gave it a fresh budget
+        for who in ("code", "ux", "ui"):
+            job(repo, "review", jid, who, "changes")
+        job(repo, "settle", jid)
+        assert state(repo, jid)["stage"] == "build"
+        job(repo, "advance", jid, "gate")
+        job(repo, "gate", jid)
+
+
+def test_an_approval_covers_one_commit_only(repo):
+    jid = job(repo, "create", "3").stdout.strip()
+    to_review(repo, jid, "high", "security")
+    for who in ("code", "security"):
+        job(repo, "review", jid, who, "approve")
+    job(repo, "settle", jid)
+    job(repo, "set", jid, "pr=9")
+    assert job(repo, "approve", jid, "approve").stdout.strip() == "needs-human"
+    approved = state(repo, jid)["approved_head"]
+    assert approved == state(repo, jid)["gates"]["1"]["head"]
+    # the person sends it back for another build; the old approval must not survive
+    assert release_as_person(repo, jid, "build", "3").returncode == 0
+    assert "approved_head" not in state(repo, jid)
+    wt = repo / state(repo, jid)["worktree"]
+    (wt / "more.txt").write_text("new work\n")
+    subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "more"], cwd=wt, check=True)
+    job(repo, "advance", jid, "gate")
+    job(repo, "gate", jid)
+    for who in ("code", "security"):
+        job(repo, "review", jid, who, "changes")
+    job(repo, "settle", jid)
+    job(repo, "advance", jid, "gate"), job(repo, "gate", jid)
+    for who in ("code", "security"):
+        job(repo, "review", jid, who, "changes")
+    job(repo, "settle", jid)
+    job(repo, "advance", jid, "gate"), job(repo, "gate", jid)
+    for who in ("code", "security"):
+        job(repo, "review", jid, who, "changes")
+    job(repo, "settle", jid)
+    s = state(repo, jid)
+    assert s["stage"] == "needs-human" and "approved_head" not in s
+    # an approval was logged once, long ago, for a different commit: release to merge is refused
+    assert any(h["event"] == "approver:approve" for h in s["history"])
+    assert release_as_person(repo, jid, "merge", "3").returncode != 0
+    assert state(repo, jid)["stage"] == "needs-human"
 
 
 def test_only_the_jobs_own_pull_request_can_be_recorded_or_merged(repo):
@@ -341,6 +392,32 @@ def test_jobs_get_separate_worktrees_and_branches(repo):
     assert wa != wb and wa.is_dir() and wb.is_dir()
     head = lambda w: subprocess.run(["git", "branch", "--show-current"], cwd=w, capture_output=True, text=True).stdout.strip()  # noqa: E731
     assert head(wa) == f"factory/{a}" and head(wb) == f"factory/{b}" and head(repo) == "main"
+
+
+def test_push_sends_only_the_jobs_own_branch(repo, tmp_path):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+    git = lambda cwd, *a: subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True)  # noqa: E731
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-q", "origin", "main")
+    jid = job(repo, "create", "1").stdout.strip()
+    assert job(repo, "push", jid, ok=False).returncode != 0                    # not at build yet
+    job(repo, "intake", jid, "accept", "--risk", "low")
+    (repo / "factory" / "jobs" / jid / "spec.md").write_text("s")
+    job(repo, "advance", jid, "build")
+    job(repo, "worktree", jid)
+    wt = repo / state(repo, jid)["worktree"]
+    (wt / "feature.txt").write_text("work\n")
+    git(wt, "add", "-A"), git(wt, "commit", "-q", "-m", "work")
+    main_before = git(remote, "rev-parse", "main").stdout
+    assert job(repo, "push", jid).stdout.strip() == f"factory/{jid}"
+    assert git(remote, "rev-parse", f"factory/{jid}").stdout == git(wt, "rev-parse", "HEAD").stdout
+    assert git(remote, "rev-parse", "main").stdout == main_before
+    git(wt, "checkout", "-q", "-B", "main")                                    # a builder that wandered onto main
+    assert job(repo, "push", jid, ok=False).returncode == 5
+    assert git(remote, "rev-parse", "main").stdout == main_before
+    settings = json.loads((KIT / "factory" / "settings.example.json").read_text())["permissions"]
+    assert "Bash(git push:*)" in settings["deny"] and not any(r.startswith("Bash(git push") for r in settings["allow"])
 
 
 def test_installer_never_overwrites(repo):
