@@ -23,6 +23,16 @@ if args[:2] == ["issue", "list"]:
 elif args[:2] == ["issue", "view"]:
     n = int(args[2]); i = next(x for x in state["issues"] if x["number"] == n)
     print(json.dumps({**i, "url": f"https://github.com/o/r/issues/{n}", "author": {"login": "someone"}}))
+elif args[:2] == ["pr", "view"]:
+    n = args[2]; pr = state.get("prs", {}).get(n)
+    if pr is None:
+        import subprocess
+        branches = subprocess.run(["git", "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads/factory/"],
+                                  capture_output=True, text=True).stdout.split("\n")
+        want = state.get("pr_branch", {}).get(n)
+        name, oid = next((b.split() for b in branches if b and (want is None or b.split()[0] == want)), ("factory/none", "0"))
+        pr = {"number": int(n), "state": "OPEN", "headRefName": name, "headRefOid": oid, "isCrossRepository": False}
+    print(json.dumps(pr))
 elif args[:2] == ["pr", "merge"]:
     if state.get("merge_fails"): sys.stderr.write("not mergeable\n"); sys.exit(1)
 '''
@@ -60,6 +70,19 @@ def job(repo, *args, ok=True):
     p = subprocess.run([str(repo / "factory" / "bin" / "job"), *args], cwd=repo, capture_output=True, text=True)
     if ok:
         assert p.returncode == 0, p.stderr
+    return p
+
+
+def release_as_person(repo, jid, stage, answer):
+    """Run `job release` attached to a pseudo-terminal, typing `answer` at the prompt."""
+    import pty
+    master, slave = pty.openpty()
+    p = subprocess.Popen([str(repo / "factory" / "bin" / "job"), "release", jid, stage], cwd=repo,
+                         stdin=slave, stdout=slave, stderr=subprocess.PIPE, text=True)
+    os.close(slave)
+    os.write(master, (answer + "\n").encode())
+    p.wait(timeout=20)
+    os.close(master)
     return p
 
 
@@ -112,7 +135,8 @@ def test_happy_path_ends_in_a_merge(repo):
     job(repo, "merge", jid)
     s = state(repo, jid)
     assert s["stage"] == "done" and not (repo / s["worktree"]).exists()
-    assert "pr merge 6 --squash --delete-branch" in Path(os.environ["FAKE_GH_LOG"]).read_text()
+    reviewed = s["gates"]["1"]["head"]
+    assert f"pr merge 6 --squash --delete-branch --match-head-commit {reviewed}" in Path(os.environ["FAKE_GH_LOG"]).read_text()
     assert nxt(repo, jid)["action"] == "none"
 
 
@@ -189,9 +213,57 @@ def test_high_risk_is_never_merged_without_a_person(repo):
     assert "person to merge" in state(repo, jid)["blocked_on"]
     assert job(repo, "merge", jid, ok=False).returncode != 0
     job(repo, "set", jid, "pr=9")
-    job(repo, "advance", jid, "merge")                                         # the person's decision
+    assert job(repo, "advance", jid, "merge", ok=False).returncode != 0        # an agent cannot release it
+    assert job(repo, "release", jid, "merge", ok=False).returncode == 4        # nor can anything without a terminal
+    assert state(repo, jid)["stage"] == "needs-human"
+    assert release_as_person(repo, jid, "merge", "wrong").returncode == 4      # the person must type the issue number
+    assert state(repo, jid)["stage"] == "needs-human"
+    assert release_as_person(repo, jid, "merge", "3").returncode == 0
     job(repo, "merge", jid)
-    assert state(repo, jid)["stage"] == "done"
+    s = state(repo, jid)
+    assert s["stage"] == "done" and any(h["event"] == "released-by-person:merge" for h in s["history"])
+
+
+def test_a_job_that_was_never_approved_cannot_be_released_to_merge(repo):
+    jid = job(repo, "create", "1").stdout.strip()
+    to_review(repo, jid, "medium", "ui")
+    for _ in range(3):
+        for who in ("code", "ux", "ui"):
+            job(repo, "review", jid, who, "changes")
+        job(repo, "settle", jid)
+        if state(repo, jid)["stage"] == "build":
+            job(repo, "advance", jid, "gate")
+            job(repo, "gate", jid)
+    assert state(repo, jid)["stage"] == "needs-human"
+    assert release_as_person(repo, jid, "merge", "1").returncode != 0
+    assert release_as_person(repo, jid, "build", "1").returncode == 0
+    assert state(repo, jid)["stage"] == "build" and state(repo, jid)["round"] == 1
+
+
+def test_only_the_jobs_own_pull_request_can_be_recorded_or_merged(repo):
+    a, b = job(repo, "create", "1").stdout.strip(), job(repo, "create", "2").stdout.strip()
+    for jid in (a, b):
+        to_review(repo, jid, "low")
+        job(repo, "review", jid, "code", "approve")
+        job(repo, "settle", jid)
+    gh_state = Path(os.environ["FAKE_GH_STATE"])
+    st = json.loads(gh_state.read_text())
+    st["pr_branch"] = {"6": f"factory/{a}", "7": f"factory/{b}"}
+    gh_state.write_text(json.dumps(st))
+    assert job(repo, "set", a, "pr=7", ok=False).returncode == 5               # another job's pull request
+    assert job(repo, "set", a, "branch=main", ok=False).returncode != 0
+    assert job(repo, "set", a, "worktree=..", ok=False).returncode != 0
+    job(repo, "set", a, "pr=6")
+    job(repo, "approve", a, "approve")
+    # the branch moves after it was checked and reviewed
+    wt = repo / state(repo, a)["worktree"]
+    (wt / "late.txt").write_text("unreviewed\n")
+    subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "late"], cwd=wt, check=True)
+    assert job(repo, "merge", a, ok=False).returncode == 5
+    s = state(repo, a)
+    assert s["stage"] == "needs-human" and "changed after" in s["blocked_on"]
+    assert "pr merge" not in Path(os.environ["FAKE_GH_LOG"]).read_text()
 
 
 def test_auto_merge_can_be_switched_off(repo):
@@ -314,6 +386,7 @@ def test_agent_and_skill_files_are_well_formed():
 def test_dashboard_serves_jobs(repo):
     import socket
     import time
+    import urllib.error
     import urllib.request
     job(repo, "create", "1")
     s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
@@ -327,5 +400,9 @@ def test_dashboard_serves_jobs(repo):
                 time.sleep(0.1)
         assert [j["id"] for j in data["jobs"]] == ["001-dark-mode"]
         assert b"Software factory" in urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1).read()
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/jobs", headers={"Host": "evil.example"})
+        with pytest.raises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(req, timeout=1)
+        assert err.value.code == 403
     finally:
         p.terminate()

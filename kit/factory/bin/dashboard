@@ -38,6 +38,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:                         # noqa: N802
+        # Answer only requests addressed to this machine by name, so a web page that points a
+        # hostname at 127.0.0.1 cannot read the board.
+        port = self.server.server_address[1]
+        if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self._send(403, b"forbidden", "text/plain")
+            return
         if self.path == "/api/jobs":
             self._send(200, json.dumps({"repo": ROOT.name, "jobs": jobs()}).encode(), "application/json")
         elif self.path in ("/", "/index.html"):

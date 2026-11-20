@@ -270,16 +270,38 @@ def cmd_intake(a) -> None:
 
 def cmd_advance(a) -> None:
     job = load(a.id)
-    allowed = {"spec": {"build"}, "build": {"gate"}, "needs-info": {"intake"}, "needs-human": {"build", "merge", "rejected"}}
+    allowed = {"spec": {"build"}, "build": {"gate"}, "needs-info": {"intake"}}
+    if job["stage"] == "needs-human":
+        die("only a person can release this job: run `factory/bin/job release <id> <build|merge|rejected>` in a terminal")
     if a.stage not in allowed.get(job["stage"], set()):
         die(f"cannot move {job['stage']} -> {a.stage}; other moves are made by intake, gate, review, settle, approve and merge")
     if job["stage"] == "spec" and not (job_dir(job["id"]) / "spec.md").exists():
         die("spec.md is missing; the spec writer must write it first")
-    if job["stage"] == "needs-human" and a.stage == "build":
-        job["round"] = 1                       # a person has reset the job
     job["stage"] = a.stage
     job.pop("blocked_on", None)
     log(job, "advance", a.note or "")
+    save(job)
+    print(job["stage"])
+
+
+def cmd_release(a) -> None:
+    """A person's decision on a job parked at needs-human. Refuses to run without a terminal,
+    so an agent calling it through a tool cannot stand in for the person."""
+    job = load(a.id)
+    if job["stage"] != "needs-human":
+        die(f"job is at {job['stage']}, not needs-human")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("release must be run by a person in a terminal", 4)
+    if a.stage == "merge" and not any(h["event"] == "approver:approve" for h in job.get("history", [])):
+        die("this job was never approved; choose build or rejected")
+    print(f"{job['id']}: {job['title']}\n  parked because: {job.get('blocked_on', '')}\n  you chose: {a.stage}")
+    if input(f"Type the issue number ({job['issue']}) to confirm: ").strip() != str(job["issue"]):
+        die("not confirmed; nothing changed", 4)
+    if a.stage == "build":
+        job["round"] = 1
+    job["stage"] = a.stage
+    job.pop("blocked_on", None)
+    log(job, f"released-by-person:{a.stage}", a.note or "")
     save(job)
     print(job["stage"])
 
@@ -288,10 +310,28 @@ def cmd_set(a) -> None:
     job = load(a.id)
     for pair in a.pairs:
         key, _, value = pair.partition("=")
-        if key not in ("pr", "worktree", "branch"):
-            die(f"only pr, worktree and branch can be set directly, not {key!r}")
-        job[key] = int(value) if key == "pr" else value
+        if key != "pr" or not value.isdigit():
+            die("only pr=<number> can be set; the branch and worktree are fixed by the job id")
+        check_pr(job, int(value))
+        job["pr"] = int(value)
     save(job)
+
+
+def check_pr(job: dict, number: int) -> dict:
+    """The pull request must be this job's own branch, in this repository, and still open."""
+    pr = json.loads(gh("pr", "view", str(number), "--json", "number,state,headRefName,headRefOid,isCrossRepository"))
+    if pr.get("isCrossRepository"):
+        die(f"PR #{number} comes from another repository", 5)
+    if pr.get("headRefName") != job["branch"]:
+        die(f"PR #{number} is for branch {pr.get('headRefName')!r}, not this job's {job['branch']!r}", 5)
+    if pr.get("state") != "OPEN":
+        die(f"PR #{number} is {pr.get('state')}, not open", 5)
+    return pr
+
+
+def head_of(job: dict) -> str:
+    cwd = ROOT / (job.get("worktree") or ".")
+    return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=cwd).stdout.strip()
 
 
 def default_branch() -> str:
@@ -328,7 +368,7 @@ def cmd_gate(a) -> None:
     r = subprocess.run(["bash", str(checks)], capture_output=True, text=True, cwd=cwd)
     logfile.write_text(f"$ factory/checks.sh  (exit {r.returncode})\n{r.stdout}\n{r.stderr}")
     passed = r.returncode == 0
-    job.setdefault("gates", {})[str(rnd)] = {"passed": passed, "log": str(logfile.relative_to(ROOT))}
+    job.setdefault("gates", {})[str(rnd)] = {"passed": passed, "log": str(logfile.relative_to(ROOT)), "head": head_of(job)}
     if passed:
         job["stage"] = "review"
         log(job, "gate:pass")
@@ -399,7 +439,14 @@ def cmd_merge(a) -> None:
         die(f"job is at {job['stage']}, not merge")
     if not job.get("pr"):
         die("the job has no pull request number; set it with `job set <id> pr=<number>`")
-    gh("pr", "merge", str(job["pr"]), f"--{cfg['merge_method']}", "--delete-branch")
+    reviewed = job.get("gates", {}).get(str(job.get("round", 1)), {}).get("head")
+    pr = check_pr(job, job["pr"])
+    if not reviewed or pr.get("headRefOid") != reviewed:
+        job.update(stage="needs-human", blocked_on="the pull request changed after it was checked and reviewed; it was not merged")
+        log(job, "merge-refused", f"reviewed {reviewed}, pull request is at {pr.get('headRefOid')}")
+        save(job)
+        die(job["blocked_on"], 5)
+    gh("pr", "merge", str(job["pr"]), f"--{cfg['merge_method']}", "--delete-branch", "--match-head-commit", reviewed)
     job["stage"] = "done"
     log(job, "merged", f"PR #{job['pr']}")
     save(job)
@@ -427,8 +474,10 @@ def main() -> None:
     add("next", cmd_next, "what the orchestrator should do next with a job", ID)
     add("intake", cmd_intake, "record the intake decision", ID, (("verdict",), {"choices": ["accept", "needs-info", "reject"]}),
         (("--risk",), {"choices": RISK}), (("--surfaces",), {"help": "comma-separated: " + ",".join(SURFACES)}), NOTE)
-    add("advance", cmd_advance, "move spec->build, build->gate, or release a parked job", ID, (("stage",), {"choices": STAGES}), NOTE)
-    add("set", cmd_set, "record pr=, worktree= or branch=", ID, (("pairs",), {"nargs": "+"}))
+    add("advance", cmd_advance, "move spec->build, build->gate, or needs-info->intake", ID, (("stage",), {"choices": STAGES}), NOTE)
+    add("release", cmd_release, "a person's decision on a job at needs-human (needs a terminal)", ID,
+        (("stage",), {"choices": ["build", "merge", "rejected"]}), NOTE)
+    add("set", cmd_set, "record pr=<number>, after checking it is this job's pull request", ID, (("pairs",), {"nargs": "+"}))
     add("worktree", cmd_worktree, "create the job's git worktree and branch", ID)
     add("gate", cmd_gate, "run factory/checks.sh in the job's worktree", ID)
     add("review", cmd_review, "record one reviewer's verdict", ID, (("reviewer",), {"choices": REVIEWERS}),
