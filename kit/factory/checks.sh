@@ -24,7 +24,15 @@ fi
 
 # Node projects: use the scripts the project defines.
 if [ -f package.json ] && has npm; then
-  [ -d node_modules ] || run "install" npm ci --no-audit --no-fund
+  # Install only when the project has dependencies to install. A project with no lockfile and
+  # no dependencies needs nothing; one with dependencies and no lockfile is installed with `npm install`.
+  if [ ! -d node_modules ]; then
+    if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+      run "install" npm ci --no-audit --no-fund
+    elif node -e "const p=require('./package.json'); process.exit(Object.keys({...p.dependencies,...p.devDependencies}).length ? 0 : 1)" 2>/dev/null; then
+      run "install" npm install --no-audit --no-fund
+    fi
+  fi
   for script in lint typecheck test build; do
     if node -e "process.exit(require('./package.json').scripts?.['$script'] ? 0 : 1)" 2>/dev/null; then
       run "npm $script" npm run --silent "$script"
