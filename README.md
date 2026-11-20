@@ -44,12 +44,16 @@ review three times stops and waits for a person.
 - **Only a person can release a parked job.** `factory/bin/job release` refuses to run
   without a terminal and asks you to type the issue number, so an agent cannot approve its
   own escalation.
-- **Only the reviewed commit is merged.** The merge checks that the pull request is the
-  job's own branch and still at the commit that passed the gate and review. If it moved,
-  the job stops for a person.
+- **Only the reviewed commit is merged.** An approval is recorded against one commit. The
+  merge checks that the pull request is the job's own branch and still at that commit. If
+  it moved, or the job went back for more work, the approval is gone. Round numbers never
+  repeat, so an old gate result or review cannot be counted again.
 - **The board answers only requests addressed to this machine.**
 - **No permission bypass is needed.** `factory/settings.example.json` allows the specific
-  commands the factory uses and denies force-pushes and direct merges.
+  commands the factory uses and denies `git push`, direct merges and releasing a parked job.
+  Agents push through `factory/bin/job push`, which can only push a job's own branch and
+  never forces. Turn on branch protection for your default branch on GitHub as well, so the
+  rule holds whatever the local settings are.
 - **Issue text is treated as a request, not as instructions.** Intake and the reviewers are
   told to reject or report text that tries to steer them.
 
@@ -127,7 +131,7 @@ interface review. Change them to fit your budget.
 | `kit/factory/bin/dashboard`, `kit/factory/dashboard/` | The local, read-only board |
 | `kit/factory/FACTORY.md`, `config.json`, `settings.example.json` | Project rules, settings, permissions |
 | `install.sh` | Copies the kit into a repository |
-| `tests/` | 32 tests of the rules, the gate, the installer, the agent files and the board |
+| `tests/` | 34 tests of the rules, the gate, the installer, the agent files and the board |
 
 Run the tests with `uv run pytest -q`. They replace `gh` with a local stand-in and use no network.
 

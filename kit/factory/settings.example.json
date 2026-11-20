@@ -10,6 +10,7 @@
       "Bash(factory/bin/job advance:*)",
       "Bash(factory/bin/job set:*)",
       "Bash(factory/bin/job worktree:*)",
+      "Bash(factory/bin/job push:*)",
       "Bash(factory/bin/job gate:*)",
       "Bash(factory/bin/job review:*)",
       "Bash(factory/bin/job settle:*)",
@@ -28,13 +29,11 @@
       "Bash(git log:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)",
       "Bash(git branch:*)",
       "Bash(git worktree:*)"
     ],
     "deny": [
-      "Bash(git push --force:*)",
-      "Bash(git push -f:*)",
+      "Bash(git push:*)",
       "Bash(gh pr merge:*)",
       "Bash(gh repo delete:*)",
       "Bash(factory/bin/job release:*)"
