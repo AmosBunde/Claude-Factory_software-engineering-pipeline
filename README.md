@@ -127,7 +127,7 @@ interface review. Change them to fit your budget.
 | `kit/factory/bin/dashboard`, `kit/factory/dashboard/` | The local, read-only board |
 | `kit/factory/FACTORY.md`, `config.json`, `settings.example.json` | Project rules, settings, permissions |
 | `install.sh` | Copies the kit into a repository |
-| `tests/` | 31 tests of the rules, the gate, the installer, the agent files and the board |
+| `tests/` | 32 tests of the rules, the gate, the installer, the agent files and the board |
 
 Run the tests with `uv run pytest -q`. They replace `gh` with a local stand-in and use no network.
 

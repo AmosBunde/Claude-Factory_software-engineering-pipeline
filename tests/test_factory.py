@@ -362,6 +362,23 @@ def test_default_checks_fail_an_empty_branch_and_pass_a_real_change(repo):
     assert run("bash", str(checks)).returncode == 0
 
 
+def test_default_checks_run_a_node_project_that_has_no_dependencies(repo):
+    import shutil
+    if not shutil.which("node"):
+        pytest.skip("node is not installed")
+    checks = KIT / "factory" / "checks.sh"
+    run = lambda *a: subprocess.run(a, cwd=repo, capture_output=True, text=True)  # noqa: E731
+    run("git", "checkout", "-q", "-b", "factory/y")
+    (repo / "package.json").write_text('{"name":"x","type":"module","scripts":{"test":"node --test t.test.js"}}')
+    (repo / "t.test.js").write_text('import {test} from "node:test"; import assert from "node:assert"; test("ok", () => assert.equal(1, 1));')
+    run("git", "add", "-A"), run("git", "commit", "-q", "-m", "node")
+    p = run("bash", str(checks))
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "npm test: ok" in p.stdout and "install" not in p.stdout
+    (repo / "t.test.js").write_text('import {test} from "node:test"; import assert from "node:assert"; test("bad", () => assert.equal(1, 2));')
+    assert run("bash", str(checks)).returncode == 1
+
+
 def test_agent_and_skill_files_are_well_formed():
     agents = sorted((KIT / ".claude" / "agents").glob("*.md"))
     assert len(agents) == 8
