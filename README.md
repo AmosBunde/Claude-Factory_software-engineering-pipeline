@@ -34,7 +34,7 @@ review three times stops and waits for a person.
 ## What makes it safe to leave running
 
 - **The orchestrator decides nothing.** Every rule (stage order, which reviews are required,
-  round limits, when to merge) is in `factory/bin/job`, a 400-line script with tests. The
+  round limits, when to merge) is in `factory/bin/job`, a script of about 450 lines, with tests. The
   `/factory` command asks it what to do next and does that.
 - **The gate cannot be weakened by the builder.** Checks run from the main checkout's copy
   of `factory/checks.sh`, not the copy on the job's branch.
