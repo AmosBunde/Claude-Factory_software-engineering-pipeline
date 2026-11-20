@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""State for the software factory: one job per GitHub issue.
+
+The orchestrator (the /factory command) never decides what happens next by itself. It
+asks `job next <id>` and does what that says. Every rule about stages, review routing,
+round limits and merging lives in this file, where it can be read and tested.
+
+Run `factory/bin/job --help` for the commands.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("FACTORY_ROOT") or subprocess.run(
+    ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip() or ".").resolve()
+JOBS = ROOT / "factory" / "jobs"
+WORKTREES = ROOT / ".factory-worktrees"
+CONFIG = ROOT / "factory" / "config.json"
+
+DEFAULTS = {
+    "label": "factory",          # issues with this label enter the factory
+    "max_parallel_jobs": 3,
+    "max_build_rounds": 3,       # after this many failed gates or change requests, a human decides
+    "auto_merge": True,          # False: the approver's approval stops at "needs-human" for the merge itself
+    "auto_merge_max_risk": "medium",   # jobs above this risk are never merged without a human
+    "merge_method": "squash",
+    "models": {
+        "intake": "fable", "spec": "opus", "builder": "opus",
+        "review-code": "haiku", "review-code-risky": "sonnet",
+        "review-ux": "sonnet", "review-ui": "haiku", "review-security": "opus", "approver": "opus",
+    },
+}
+STAGES = ("intake", "spec", "build", "gate", "review", "approve", "merge", "done",
+          "needs-info", "rejected", "needs-human")
+TERMINAL = {"done", "rejected"}
+WAITING = {"needs-info", "needs-human"}          # parked until a person acts
+RISK = ("low", "medium", "high")
+SURFACES = ("ui", "security", "data", "api", "infra", "docs")
+REVIEWERS = ("code", "ux", "ui", "security")
+SAFE_ID = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def die(msg: str, code: int = 2):
+    print(f"job: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))
+    if CONFIG.exists():
+        user = json.loads(CONFIG.read_text())
+        cfg["models"].update(user.pop("models", {}))
+        cfg.update(user)
+    return cfg
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def job_dir(job_id: str) -> Path:
+    if not SAFE_ID.fullmatch(job_id) or job_id in (".", ".."):
+        die(f"unsafe job id {job_id!r}")
+    return JOBS / job_id
+
+
+def load(job_id: str) -> dict:
+    path = job_dir(job_id) / "job.json"
+    if not path.exists():
+        die(f"no job {job_id!r}; see `job list`")
+    return json.loads(path.read_text())
+
+
+def save(job: dict) -> None:
+    d = job_dir(job["id"])
+    d.mkdir(parents=True, exist_ok=True)
+    job["updated"] = now()
+    tmp = d / "job.json.tmp"
+    tmp.write_text(json.dumps(job, indent=2) + "\n")
+    tmp.replace(d / "job.json")
+
+
+def all_jobs() -> list[dict]:
+    if not JOBS.exists():
+        return []
+    return [json.loads(p.read_text()) for p in sorted(JOBS.glob("*/job.json"))]
+
+
+def log(job: dict, event: str, note: str = "") -> None:
+    job.setdefault("history", []).append({"at": now(), "stage": job["stage"], "event": event, "note": note})
+
+
+def gh(*args: str) -> str:
+    r = subprocess.run(["gh", *args], capture_output=True, text=True, cwd=ROOT)
+    if r.returncode != 0:
+        die(f"gh {' '.join(args)} failed: {r.stderr.strip()}", 3)
+    return r.stdout
+
+
+def slug(title: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return "-".join(s.split("-")[:5])[:40].strip("-") or "issue"
+
+
+# ----------------------------------------------------------------------------------------------
+# Rules
+# ----------------------------------------------------------------------------------------------
+
+def required_reviewers(job: dict, cfg: dict) -> list[dict]:
+    """Which reviews a job needs, and on which model. Routed by risk and by what the change touches."""
+    risk, surfaces = job.get("risk", "medium"), set(job.get("surfaces", []))
+    risky = risk == "high"
+    m = cfg["models"]
+    out = [{"reviewer": "code", "agent": "factory-reviewer-code", "model": m["review-code-risky"] if risky else m["review-code"]}]
+    if "ui" in surfaces:
+        out.append({"reviewer": "ux", "agent": "factory-reviewer-ux", "model": m["review-ux"]})
+        out.append({"reviewer": "ui", "agent": "factory-reviewer-ui", "model": m["review-ui"]})
+    if risky or surfaces & {"security", "data", "infra"}:
+        out.append({"reviewer": "security", "agent": "factory-reviewer-security", "model": m["review-security"]})
+    return out
+
+
+def round_reviews(job: dict) -> dict:
+    return job.get("reviews", {}).get(str(job.get("round", 1)), {})
+
+
+def next_step(job: dict, cfg: dict) -> dict:
+    """The single source of truth for what the orchestrator does next with a job."""
+    stage, jid, m = job["stage"], job["id"], cfg["models"]
+    rnd = job.get("round", 1)
+    if stage in TERMINAL:
+        return {"action": "none", "why": f"job is {stage}"}
+    if stage in WAITING:
+        return {"action": "wait-for-human", "why": job.get("blocked_on", stage)}
+    if stage == "intake":
+        return {"action": "run-agent", "agent": "factory-intake", "model": m["intake"],
+                "then": f"job intake {jid} <accept|needs-info|reject> --risk <low|medium|high> --surfaces <list> --note <one line>"}
+    if stage == "spec":
+        return {"action": "run-agent", "agent": "factory-spec-writer", "model": m["spec"],
+                "writes": str((job_dir(jid) / "spec.md").relative_to(ROOT)), "then": f"job advance {jid} build"}
+    if stage == "build":
+        if not job.get("worktree"):
+            return {"action": "run-command", "command": f"factory/bin/job worktree {jid}"}
+        return {"action": "run-agent", "agent": "factory-builder", "model": m["builder"], "round": rnd,
+                "worktree": job["worktree"], "feedback": feedback_files(job), "then": f"job advance {jid} gate"}
+    if stage == "gate":
+        return {"action": "run-command", "command": f"factory/bin/job gate {jid}",
+                "why": "runs factory/checks.sh in the worktree; pass moves to review, fail sends the log back to the builder"}
+    if stage == "review":
+        done = round_reviews(job)
+        todo = [r for r in required_reviewers(job, cfg) if r["reviewer"] not in done]
+        if todo:
+            return {"action": "run-agents-in-parallel", "round": rnd, "agents": todo, "worktree": job.get("worktree"),
+                    "then": f"job review {jid} <reviewer> <approve|changes> --note <one line>   (once per reviewer)"}
+        return {"action": "run-command", "command": f"factory/bin/job settle {jid}",
+                "why": "all reviews are in; settle sends the job to the approver or back to the builder"}
+    if stage == "approve":
+        return {"action": "run-agent", "agent": "factory-approver", "model": m["approver"],
+                "then": f"job approve {jid} <approve|changes|escalate> --note <one line>"}
+    if stage == "merge":
+        return {"action": "run-command", "command": f"factory/bin/job merge {jid}"}
+    return {"action": "none", "why": f"unknown stage {stage}"}
+
+
+def feedback_files(job: dict) -> list[str]:
+    d = job_dir(job["id"])
+    return sorted(str(p.relative_to(ROOT)) for p in d.glob(f"round-{job.get('round', 1) - 1}-*") if p.is_file())
+
+
+def bounce(job: dict, cfg: dict, reason: str) -> None:
+    """Send a job back to the builder for another round, or to a human if the rounds are used up."""
+    if job.get("round", 1) >= cfg["max_build_rounds"]:
+        job["stage"], job["blocked_on"] = "needs-human", f"{reason} after {job.get('round', 1)} rounds"
+        log(job, "escalated", job["blocked_on"])
+    else:
+        job["round"] = job.get("round", 1) + 1
+        job["stage"] = "build"
+        log(job, "back-to-builder", reason)
+
+
+# ----------------------------------------------------------------------------------------------
+# Commands
+# ----------------------------------------------------------------------------------------------
+
+def cmd_queue(a) -> None:
+    cfg = config()
+    jobs = all_jobs()
+    taken = {j["issue"] for j in jobs}
+    issues = json.loads(gh("issue", "list", "--label", cfg["label"], "--state", "open", "--limit", "100",
+                           "--json", "number,title,updatedAt"))
+    new = [i for i in issues if i["number"] not in taken]
+    active = [j for j in jobs if j["stage"] not in TERMINAL | WAITING]
+    waiting = [j for j in jobs if j["stage"] in WAITING]
+    slots = max(0, cfg["max_parallel_jobs"] - len(active))
+    out = {"new_issues": new, "active_jobs": [{"id": j["id"], "stage": j["stage"], "round": j.get("round", 1)} for j in active],
+           "waiting_on_human": [{"id": j["id"], "stage": j["stage"], "why": j.get("blocked_on", "")} for j in waiting],
+           "free_slots": slots, "start_now": [i["number"] for i in new[:slots]]}
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    print(f"{len(new)} new issue(s) labelled '{cfg['label']}', {len(active)} active job(s), "
+          f"{len(waiting)} waiting on a human, {slots} free slot(s)")
+    for i in new:
+        print(f"  new      #{i['number']:<5} {i['title']}")
+    for j in active:
+        print(f"  active   {j['id']:<28} {j['stage']} (round {j.get('round', 1)})")
+    for j in waiting:
+        print(f"  waiting  {j['id']:<28} {j['stage']}: {j.get('blocked_on', '')}")
+
+
+def cmd_create(a) -> None:
+    issue = json.loads(gh("issue", "view", str(a.issue), "--json", "number,title,url,author"))
+    if any(j["issue"] == issue["number"] for j in all_jobs()):
+        die(f"issue #{issue['number']} already has a job")
+    job_id = f"{issue['number']:03d}-{slug(issue['title'])}"
+    job = {"id": job_id, "issue": issue["number"], "title": issue["title"], "url": issue.get("url", ""),
+           "stage": "intake", "round": 1, "risk": None, "surfaces": [], "branch": f"factory/{job_id}",
+           "worktree": None, "pr": None, "reviews": {}, "gates": {}, "history": [], "created": now()}
+    log(job, "created", f"from issue #{issue['number']}")
+    save(job)
+    print(job_id)
+
+
+def cmd_list(a) -> None:
+    jobs = all_jobs()
+    if a.json:
+        print(json.dumps(jobs, indent=2))
+        return
+    for j in jobs:
+        print(f"{j['id']:<30} {j['stage']:<12} round {j.get('round', 1)}  risk {j.get('risk') or '-':<6} "
+              f"pr {j.get('pr') or '-'}  {j['title']}")
+
+
+def cmd_show(a) -> None:
+    print(json.dumps(load(a.id), indent=2))
+
+
+def cmd_next(a) -> None:
+    print(json.dumps(next_step(load(a.id), config()), indent=2))
+
+
+def cmd_intake(a) -> None:
+    job = load(a.id)
+    if job["stage"] not in ("intake", "needs-info"):
+        die(f"job is at {job['stage']}, not intake")
+    if a.verdict == "accept":
+        if a.risk not in RISK:
+            die("--risk low|medium|high is required to accept")
+        surfaces = [s for s in (a.surfaces or "").split(",") if s]
+        bad = [s for s in surfaces if s not in SURFACES]
+        if bad:
+            die(f"unknown surface(s) {bad}; choose from {', '.join(SURFACES)}")
+        job.update(risk=a.risk, surfaces=surfaces, stage="spec")
+        job.pop("blocked_on", None)
+    elif a.verdict == "needs-info":
+        job.update(stage="needs-info", blocked_on=a.note or "the issue needs more detail")
+    else:
+        job["stage"] = "rejected"
+    log(job, f"intake:{a.verdict}", a.note or "")
+    save(job)
+    print(job["stage"])
+
+
+def cmd_advance(a) -> None:
+    job = load(a.id)
+    allowed = {"spec": {"build"}, "build": {"gate"}, "needs-info": {"intake"}, "needs-human": {"build", "merge", "rejected"}}
+    if a.stage not in allowed.get(job["stage"], set()):
+        die(f"cannot move {job['stage']} -> {a.stage}; other moves are made by intake, gate, review, settle, approve and merge")
+    if job["stage"] == "spec" and not (job_dir(job["id"]) / "spec.md").exists():
+        die("spec.md is missing; the spec writer must write it first")
+    if job["stage"] == "needs-human" and a.stage == "build":
+        job["round"] = 1                       # a person has reset the job
+    job["stage"] = a.stage
+    job.pop("blocked_on", None)
+    log(job, "advance", a.note or "")
+    save(job)
+    print(job["stage"])
+
+
+def cmd_set(a) -> None:
+    job = load(a.id)
+    for pair in a.pairs:
+        key, _, value = pair.partition("=")
+        if key not in ("pr", "worktree", "branch"):
+            die(f"only pr, worktree and branch can be set directly, not {key!r}")
+        job[key] = int(value) if key == "pr" else value
+    save(job)
+
+
+def default_branch() -> str:
+    r = subprocess.run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], capture_output=True, text=True, cwd=ROOT)
+    return r.stdout.strip().removeprefix("origin/") or "main"
+
+
+def cmd_worktree(a) -> None:
+    job = load(a.id)
+    path = WORKTREES / job["id"]
+    if not path.exists():
+        WORKTREES.mkdir(exist_ok=True)
+        base = default_branch()
+        exists = subprocess.run(["git", "rev-parse", "--verify", "--quiet", job["branch"]], capture_output=True, cwd=ROOT).returncode == 0
+        cmd = ["git", "worktree", "add", str(path), job["branch"]] if exists else \
+              ["git", "worktree", "add", "-b", job["branch"], str(path), base]
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
+        if r.returncode != 0:
+            die(f"git worktree failed: {r.stderr.strip()}", 3)
+    job["worktree"] = str(path.relative_to(ROOT))
+    log(job, "worktree", job["worktree"])
+    save(job)
+    print(job["worktree"])
+
+
+def cmd_gate(a) -> None:
+    job, cfg = load(a.id), config()
+    if job["stage"] != "gate":
+        die(f"job is at {job['stage']}, not gate")
+    rnd = job.get("round", 1)
+    checks = ROOT / "factory" / "checks.sh"
+    cwd = ROOT / (job.get("worktree") or ".")
+    logfile = job_dir(job["id"]) / f"round-{rnd}-gate.log"
+    r = subprocess.run(["bash", str(checks)], capture_output=True, text=True, cwd=cwd)
+    logfile.write_text(f"$ factory/checks.sh  (exit {r.returncode})\n{r.stdout}\n{r.stderr}")
+    passed = r.returncode == 0
+    job.setdefault("gates", {})[str(rnd)] = {"passed": passed, "log": str(logfile.relative_to(ROOT))}
+    if passed:
+        job["stage"] = "review"
+        log(job, "gate:pass")
+    else:
+        log(job, "gate:fail", str(logfile.relative_to(ROOT)))
+        bounce(job, cfg, "the gate failed")
+    save(job)
+    print(json.dumps({"passed": passed, "stage": job["stage"], "log": str(logfile.relative_to(ROOT))}))
+    sys.exit(0 if passed else 1)
+
+
+def cmd_review(a) -> None:
+    job, cfg = load(a.id), config()
+    if job["stage"] != "review":
+        die(f"job is at {job['stage']}, not review")
+    needed = {r["reviewer"] for r in required_reviewers(job, cfg)}
+    if a.reviewer not in needed:
+        die(f"{a.reviewer} review is not required for this job (required: {', '.join(sorted(needed))})")
+    rnd = str(job.get("round", 1))
+    job.setdefault("reviews", {}).setdefault(rnd, {})[a.reviewer] = {"verdict": a.verdict, "note": a.note or "", "at": now()}
+    log(job, f"review:{a.reviewer}:{a.verdict}", a.note or "")
+    save(job)
+    left = sorted(needed - set(job["reviews"][rnd]))
+    print(json.dumps({"recorded": a.reviewer, "still_waiting_for": left}))
+
+
+def cmd_settle(a) -> None:
+    job, cfg = load(a.id), config()
+    if job["stage"] != "review":
+        die(f"job is at {job['stage']}, not review")
+    needed = {r["reviewer"] for r in required_reviewers(job, cfg)}
+    got = round_reviews(job)
+    if needed - set(got):
+        die(f"still waiting for: {', '.join(sorted(needed - set(got)))}")
+    changes = sorted(r for r in needed if got[r]["verdict"] == "changes")
+    if changes:
+        bounce(job, cfg, f"changes requested by {', '.join(changes)}")
+    else:
+        job["stage"] = "approve"
+        log(job, "reviews:approved")
+    save(job)
+    print(job["stage"])
+
+
+def cmd_approve(a) -> None:
+    job, cfg = load(a.id), config()
+    if job["stage"] != "approve":
+        die(f"job is at {job['stage']}, not approve")
+    log(job, f"approver:{a.verdict}", a.note or "")
+    if a.verdict == "changes":
+        bounce(job, cfg, "changes requested by the approver")
+    elif a.verdict == "escalate":
+        job.update(stage="needs-human", blocked_on=a.note or "the approver escalated")
+    else:
+        too_risky = RISK.index(job.get("risk") or "high") > RISK.index(cfg["auto_merge_max_risk"])
+        if not cfg["auto_merge"] or too_risky:
+            job.update(stage="needs-human",
+                       blocked_on="approved; waiting for a person to merge" + (" (risk above the auto-merge limit)" if too_risky else ""))
+        else:
+            job["stage"] = "merge"
+    save(job)
+    print(job["stage"])
+
+
+def cmd_merge(a) -> None:
+    job, cfg = load(a.id), config()
+    if job["stage"] != "merge":
+        die(f"job is at {job['stage']}, not merge")
+    if not job.get("pr"):
+        die("the job has no pull request number; set it with `job set <id> pr=<number>`")
+    gh("pr", "merge", str(job["pr"]), f"--{cfg['merge_method']}", "--delete-branch")
+    job["stage"] = "done"
+    log(job, "merged", f"PR #{job['pr']}")
+    save(job)
+    if job.get("worktree") and (ROOT / job["worktree"]).exists():
+        subprocess.run(["git", "worktree", "remove", "--force", job["worktree"]], capture_output=True, cwd=ROOT)
+    print("done")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="job", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    def add(name, fn, help_, *args):
+        s = sub.add_parser(name, help=help_)
+        for flags, kw in args:
+            s.add_argument(*flags, **kw)
+        s.set_defaults(fn=fn)
+
+    ID = (("id",), {"help": "job id, e.g. 001-dark-mode"})
+    NOTE = (("--note",), {"default": ""})
+    add("queue", cmd_queue, "new labelled issues, active jobs and free slots", (("--json",), {"action": "store_true"}))
+    add("create", cmd_create, "start a job from an issue number", (("issue",), {"type": int}))
+    add("list", cmd_list, "every job and its stage", (("--json",), {"action": "store_true"}))
+    add("show", cmd_show, "one job as JSON", ID)
+    add("next", cmd_next, "what the orchestrator should do next with a job", ID)
+    add("intake", cmd_intake, "record the intake decision", ID, (("verdict",), {"choices": ["accept", "needs-info", "reject"]}),
+        (("--risk",), {"choices": RISK}), (("--surfaces",), {"help": "comma-separated: " + ",".join(SURFACES)}), NOTE)
+    add("advance", cmd_advance, "move spec->build, build->gate, or release a parked job", ID, (("stage",), {"choices": STAGES}), NOTE)
+    add("set", cmd_set, "record pr=, worktree= or branch=", ID, (("pairs",), {"nargs": "+"}))
+    add("worktree", cmd_worktree, "create the job's git worktree and branch", ID)
+    add("gate", cmd_gate, "run factory/checks.sh in the job's worktree", ID)
+    add("review", cmd_review, "record one reviewer's verdict", ID, (("reviewer",), {"choices": REVIEWERS}),
+        (("verdict",), {"choices": ["approve", "changes"]}), NOTE)
+    add("settle", cmd_settle, "after all reviews: on to the approver, or back to the builder", ID)
+    add("approve", cmd_approve, "record the approver's decision", ID, (("verdict",), {"choices": ["approve", "changes", "escalate"]}), NOTE)
+    add("merge", cmd_merge, "merge the pull request and close the job", ID)
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

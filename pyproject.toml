@@ -1,0 +1,12 @@
+[project]
+name = "claude-factory"
+version = "0.1.0"
+description = "A software factory for Claude Code: GitHub issues in, reviewed pull requests out."
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

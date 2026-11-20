@@ -1,0 +1,19 @@
+{
+  "label": "factory",
+  "max_parallel_jobs": 3,
+  "max_build_rounds": 3,
+  "auto_merge": true,
+  "auto_merge_max_risk": "medium",
+  "merge_method": "squash",
+  "models": {
+    "intake": "fable",
+    "spec": "opus",
+    "builder": "opus",
+    "review-code": "haiku",
+    "review-code-risky": "sonnet",
+    "review-ux": "sonnet",
+    "review-ui": "haiku",
+    "review-security": "opus",
+    "approver": "opus"
+  }
+}

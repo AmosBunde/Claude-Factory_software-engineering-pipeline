@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Software factory</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --ink:#e8eaf0; --muted:#8b93a3; --accent:#b79cf5;
+          --ok:#5fbf8a; --warn:#e0a84e; --bad:#e2706b; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display:flex; align-items:baseline; gap:16px; padding:20px 24px 12px; flex-wrap:wrap; }
+  h1 { font-size:18px; font-weight:600; margin:0; }
+  #repo, #summary { color:var(--muted); }
+  #summary { margin-left:auto; font-size:13px; }
+  main { display:grid; grid-template-columns: repeat(7, minmax(190px, 1fr)); gap:12px; padding:8px 24px 32px; overflow-x:auto; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px; min-height:140px; }
+  h2 { font-size:13px; font-weight:600; margin:2px 4px 10px; display:flex; justify-content:space-between; }
+  h2 span { color:var(--muted); font-weight:400; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:8px; background:#1c2029; }
+  .card.live { border-color:var(--accent); }
+  .id { font-family:var(--mono); font-size:12px; color:var(--muted); }
+  .title { margin:2px 0 6px; overflow-wrap:anywhere; }
+  .meta { font-size:12px; color:var(--muted); display:flex; gap:8px; flex-wrap:wrap; }
+  .meta a { color:var(--accent); text-decoration:none; } .meta a:hover { text-decoration:underline; }
+  .chips { display:flex; gap:4px; flex-wrap:wrap; margin-top:8px; }
+  .chip { font:11px var(--mono); padding:2px 6px; border-radius:4px; border:1px solid var(--line); color:var(--muted); }
+  .chip.approve, .chip.pass { color:var(--ok); border-color:#2f5a44; }
+  .chip.changes, .chip.fail { color:var(--bad); border-color:#633532; }
+  .why { margin-top:8px; font-size:12px; color:var(--warn); }
+  .empty { color:var(--muted); font-size:13px; padding:6px 4px; }
+  @media (max-width: 900px) { main { grid-template-columns: repeat(7, 220px); } }
+</style>
+</head>
+<body>
+<header><h1>Software factory</h1><span id="repo"></span><span id="summary">loading</span></header>
+<main id="board"></main>
+<script>
+const COLUMNS = [
+  ["Intake", ["intake", "needs-info"]], ["Spec", ["spec"]], ["Build", ["build", "gate"]], ["Review", ["review"]],
+  ["Approve", ["approve", "merge"]], ["Needs human", ["needs-human"]], ["Done", ["done", "rejected"]],
+];
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+
+function card(job) {
+  const c = el("div", "card" + (["done", "rejected", "needs-human", "needs-info"].includes(job.stage) ? "" : " live"));
+  c.append(el("div", "id", job.id), el("div", "title", job.title));
+  const meta = el("div", "meta");
+  if (job.url && /^https:\/\/github\.com\//.test(job.url)) { const a = el("a", null, "issue #" + job.issue); a.href = job.url; a.target = "_blank"; a.rel = "noopener"; meta.append(a); }
+  else meta.append(el("span", null, "issue #" + job.issue));
+  if (job.pr) meta.append(el("span", null, "PR #" + job.pr));
+  meta.append(el("span", null, job.stage + (job.round > 1 ? " · round " + job.round : "")));
+  if (job.risk) meta.append(el("span", null, job.risk + " risk"));
+  c.append(meta);
+  const chips = el("div", "chips");
+  const gate = (job.gates || {})[String(job.round || 1)];
+  if (gate) chips.append(el("span", "chip " + (gate.passed ? "pass" : "fail"), "gate"));
+  for (const [who, r] of Object.entries((job.reviews || {})[String(job.round || 1)] || {})) chips.append(el("span", "chip " + r.verdict, who));
+  if (chips.children.length) c.append(chips);
+  if (job.blocked_on) c.append(el("div", "why", job.blocked_on));
+  return c;
+}
+
+async function refresh() {
+  try {
+    const data = await (await fetch("/api/jobs", { cache: "no-store" })).json();
+    document.getElementById("repo").textContent = data.repo;
+    const board = document.getElementById("board");
+    board.replaceChildren(...COLUMNS.map(([name, stages]) => {
+      const jobs = data.jobs.filter(j => stages.includes(j.stage));
+      const s = el("section");
+      const h = el("h2", null, name); h.append(el("span", null, String(jobs.length))); s.append(h);
+      if (jobs.length) s.append(...jobs.map(card)); else s.append(el("div", "empty", "nothing here"));
+      return s;
+    }));
+    const live = data.jobs.filter(j => !["done", "rejected", "needs-human", "needs-info"].includes(j.stage)).length;
+    document.getElementById("summary").textContent = `${data.jobs.length} jobs, ${live} moving, updated ${new Date().toLocaleTimeString()}`;
+  } catch (e) { document.getElementById("summary").textContent = "cannot reach the board server"; }
+}
+refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>
